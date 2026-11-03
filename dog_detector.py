@@ -4,7 +4,7 @@ Real-time dog detection + breed classification from a webcam, using PyTorch.
 Pipeline (two pretrained models, no training required):
   1. Object detector (Faster R-CNN, COCO-pretrained) finds every "dog" in the frame.
   2. Each dog crop is passed to an ImageNet classifier (EfficientNetV2 / ResNet50);
-     we keep only the 120 ImageNet dog-breed classes and pick the most likely breed.
+     we keep only the 118 ImageNet dog-breed classes and pick the most likely breed.
   3. A red box is drawn around each dog with the breed label above it.
 
 Usage:
@@ -17,7 +17,9 @@ Press 'q' or ESC to quit.
 """
 
 import argparse
+import json
 import time
+from pathlib import Path
 
 import cv2
 import torch
@@ -39,6 +41,16 @@ COCO_DOG_LABEL = 18                    # "dog" in torchvision's COCO label map
 IMAGENET_DOG_RANGE = range(151, 269)   # ImageNet classes 151..268 are dog breeds
 RED = (0, 0, 255)                      # OpenCV uses BGR
 WHITE = (255, 255, 255)
+CALIBRATION_FILE = Path(__file__).with_name("calibration.json")
+
+
+def load_temperature(key: str) -> float:
+    """Temperature for this model setup from calibration.json, or 1.0 if not calibrated."""
+    try:
+        entry = json.loads(CALIBRATION_FILE.read_text())[key]
+        return float(entry["temperature"])
+    except (FileNotFoundError, KeyError, ValueError, TypeError):
+        return 1.0
 
 
 def pick_device() -> torch.device:
@@ -51,9 +63,11 @@ def pick_device() -> torch.device:
 
 class DogBreedDetector:
     def __init__(self, device: torch.device, accurate: bool = False,
-                 det_threshold: float = 0.6):
+                 det_threshold: float = 0.6, crop_pad: float = 0.05,
+                 calibrated: bool = True):
         self.device = device
         self.det_threshold = det_threshold
+        self.crop_pad = crop_pad
 
         # --- 1. Dog detector -------------------------------------------------
         if accurate:
@@ -79,6 +93,12 @@ class DogBreedDetector:
         self.breed_names = [categories[i].replace("_", " ").title()
                             for i in IMAGENET_DOG_RANGE]
 
+        # --- 3. Confidence calibration ---------------------------------------
+        # A temperature fitted by calibrate.py makes the shown % match how often
+        # the prediction is actually right. 1.0 means "no calibration".
+        self.calibration_key = "accurate" if accurate else "fast"
+        self.temperature = load_temperature(self.calibration_key) if calibrated else 1.0
+
     @torch.inference_mode()
     def detect_dogs(self, rgb: torch.Tensor):
         """rgb: float tensor [3,H,W] in 0..1. Returns list of (box, score)."""
@@ -89,25 +109,36 @@ class DogBreedDetector:
         return list(zip(boxes.tolist(), scores.tolist()))
 
     @torch.inference_mode()
-    def classify_breeds(self, rgb: torch.Tensor, boxes):
-        """Classify each box crop. Returns list of (breed_name, probability)."""
-        if not boxes:
-            return []
+    def breed_logits(self, rgb: torch.Tensor, boxes) -> torch.Tensor:
+        """Raw (uncalibrated) dog-breed scores for each box crop: tensor [N, n_breeds]."""
         _, H, W = rgb.shape
         crops = []
         for x1, y1, x2, y2 in boxes:
             # Pad the crop slightly so the classifier sees the whole dog.
-            pw, ph = 0.05 * (x2 - x1), 0.05 * (y2 - y1)
+            pw, ph = self.crop_pad * (x2 - x1), self.crop_pad * (y2 - y1)
             x1, y1 = max(0, int(x1 - pw)), max(0, int(y1 - ph))
             x2, y2 = min(W, int(x2 + pw)), min(H, int(y2 + ph))
+            x2, y2 = max(x2, x1 + 1), max(y2, y1 + 1)   # never an empty crop
             crop = rgb[:, y1:y2, x1:x2]
             crops.append(self.cls_transform(crop))
         batch = torch.stack(crops).to(self.device)
 
-        logits = self.classifier(batch)
-        # Restrict to the 120 dog-breed classes, then softmax among them.
-        dog_probs = logits.index_select(1, self.dog_idx).softmax(dim=1)
-        probs, idx = dog_probs.max(dim=1)
+        # Keep only the 118 dog-breed classes.
+        return self.classifier(batch).index_select(1, self.dog_idx)
+
+    def breed_probs(self, rgb: torch.Tensor, boxes) -> torch.Tensor:
+        """Calibrated probabilities over the dog breeds for each box crop: [N, n_breeds].
+
+        Dividing by the temperature before the softmax corrects over- or
+        under-confidence without changing which breed ranks first.
+        """
+        return (self.breed_logits(rgb, boxes) / self.temperature).softmax(dim=1)
+
+    def classify_breeds(self, rgb: torch.Tensor, boxes):
+        """Classify each box crop. Returns list of (breed_name, probability)."""
+        if not boxes:
+            return []
+        probs, idx = self.breed_probs(rgb, boxes).max(dim=1)
         return [(self.breed_names[i], p) for i, p in zip(idx.tolist(), probs.tolist())]
 
     def process_frame(self, frame_bgr):
@@ -198,11 +229,16 @@ def main():
     p.add_argument("--image", help="run on an image file instead of the webcam")
     p.add_argument("--out", help="with --image: save annotated result here instead of showing it")
     p.add_argument("--cpu", action="store_true", help="force CPU")
+    p.add_argument("--no-calibration", action="store_true",
+                   help="show raw (uncalibrated) confidence percentages")
     args = p.parse_args()
 
     device = torch.device("cpu") if args.cpu else pick_device()
     print(f"Loading models on {device} (first run downloads weights)...")
-    model = DogBreedDetector(device, accurate=args.accurate, det_threshold=args.threshold)
+    model = DogBreedDetector(device, accurate=args.accurate, det_threshold=args.threshold,
+                             calibrated=not args.no_calibration)
+    if model.temperature != 1.0:
+        print(f"Confidence calibrated (temperature {model.temperature:.3f})")
 
     if args.image:
         run_image(model, args.image, args.out)

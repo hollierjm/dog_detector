@@ -1,0 +1,42 @@
+{
+  "fast": {
+    "temperature": 0.6802,
+    "fitted_on": "Oxford-IIIT Pet trainval (timm/oxford-iiit-pet 'train' split)",
+    "dogs": 2020,
+    "threshold": 0.6,
+    "crop_pad": 0.05,
+    "before": {
+      "nll": 0.6641,
+      "ece_pct": 19.74,
+      "mean_conf_pct": 66.3,
+      "accuracy_pct": 86.0
+    },
+    "after": {
+      "nll": 0.5102,
+      "ece_pct": 2.18,
+      "mean_conf_pct": 84.7,
+      "accuracy_pct": 86.0
+    },
+    "date": "2026-11-02T15:44:50"
+  },
+  "accurate": {
+    "temperature": 0.8539,
+    "fitted_on": "Oxford-IIIT Pet trainval (timm/oxford-iiit-pet 'train' split)",
+    "dogs": 2125,
+    "threshold": 0.6,
+    "crop_pad": 0.05,
+    "before": {
+      "nll": 0.4614,
+      "ece_pct": 5.79,
+      "mean_conf_pct": 82.5,
+      "accuracy_pct": 88.3
+    },
+    "after": {
+      "nll": 0.4387,
+      "ece_pct": 2.07,
+      "mean_conf_pct": 87.9,
+      "accuracy_pct": 88.3
+    },
+    "date": "2026-11-02T15:53:02"
+  }
+}
