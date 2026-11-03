@@ -47,6 +47,9 @@ CALIBRATION_FILE = Path(__file__).with_name("calibration.json")
 # faster than torchvision's 800 / 1000 with the same breed accuracy (90.2% vs 89.8%).
 # The fast detector keeps 800 / 1000: smaller sizes cost it recall on distant dogs.
 DETECTOR_DEFAULTS = {"fast": (800, 1000), "accurate": (640, 300)}
+# Webcam mode runs the models at most once per this many seconds (10x/s);
+# frames in between reuse the most recent boxes and labels.
+ANALYZE_INTERVAL = 0.1
 
 
 def load_temperature(key: str) -> float:
@@ -162,24 +165,109 @@ class DogBreedDetector:
         """
         return (self.breed_logits(rgb, boxes) / self.temperature).softmax(dim=1)
 
-    def classify_breeds(self, rgb: torch.Tensor, boxes):
-        """Classify each box crop. Returns list of (breed_name, probability)."""
+    def score_frame(self, frame_bgr):
+        """Detect dogs in an OpenCV BGR frame and score every breed for each.
+
+        Returns (boxes, probs): boxes are (x1, y1, x2, y2) in pixels and probs is
+        a CPU tensor [N, n_breeds] of calibrated breed probabilities.
+        """
+        rgb = TF.to_tensor(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+        boxes = [b for b, _ in self.detect_dogs(rgb)]
         if not boxes:
-            return []
-        probs, idx = self.breed_probs(rgb, boxes).max(dim=1)
-        return [(self.breed_names[i], p) for i, p in zip(idx.tolist(), probs.tolist())]
+            return [], torch.empty(0, len(self.breed_names))
+        return boxes, self.breed_probs(rgb, boxes).cpu()
+
+    def label(self, probs: torch.Tensor) -> str:
+        """Display label for one dog's breed probabilities: top breed and its %."""
+        p, i = probs.max(dim=0)
+        return f"{self.breed_names[int(i)]} ({float(p):.0%})"
+
+    def analyze(self, frame_bgr):
+        """Detect + classify dogs in an OpenCV BGR frame.
+
+        Returns list of (box, label) where box is (x1, y1, x2, y2) in pixels.
+        """
+        boxes, probs = self.score_frame(frame_bgr)
+        return [(box, self.label(p)) for box, p in zip(boxes, probs)]
 
     def process_frame(self, frame_bgr):
         """Detect + classify + draw on an OpenCV BGR frame (in place)."""
-        rgb = TF.to_tensor(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-        detections = self.detect_dogs(rgb)
-        boxes = [b for b, _ in detections]
-        breeds = self.classify_breeds(rgb, boxes)
+        results = self.analyze(frame_bgr)
+        draw_results(frame_bgr, results)
+        return frame_bgr, len(results)
 
-        for (x1, y1, x2, y2), (breed, prob) in zip(boxes, breeds):
-            draw_labeled_box(frame_bgr, int(x1), int(y1), int(x2), int(y2),
-                             f"{breed} ({prob:.0%})")
-        return frame_bgr, len(boxes)
+
+def box_iou(a, b) -> float:
+    """Intersection-over-union of two (x1, y1, x2, y2) boxes."""
+    iw = min(a[2], b[2]) - max(a[0], b[0])
+    ih = min(a[3], b[3]) - max(a[1], b[1])
+    if iw <= 0 or ih <= 0:
+        return 0.0
+    inter = iw * ih
+    area = lambda r: (r[2] - r[0]) * (r[3] - r[1])
+    return inter / (area(a) + area(b) - inter)
+
+
+class BreedTracker:
+    """Keeps each dog's breed label steady across webcam frames.
+
+    A single frame's top breed often flips between look-alike breeds (e.g.
+    Border Collie / Collie) as the dog moves. Instead, each dog is followed from
+    frame to frame by box overlap, its breed probabilities are averaged over
+    time, and the label shows the breed with the highest average.
+
+    min_iou:    box overlap needed to count as the same dog as last time.
+    max_misses: frames a dog can go undetected before its history is dropped,
+                so a brief missed detection doesn't reset the label.
+    min_weight: weight of the newest frame once a dog has been seen 1/min_weight
+                times; before that it's a plain average. Keeping a floor lets
+                the label still change if it was wrong at first.
+    """
+
+    def __init__(self, min_iou: float = 0.3, max_misses: int = 5, min_weight: float = 0.1):
+        self.min_iou, self.max_misses, self.min_weight = min_iou, max_misses, min_weight
+        self.tracks = []   # dicts: box, probs (running average), seen, misses
+
+    def update(self, boxes, probs: torch.Tensor):
+        """Add one frame's detections; returns the smoothed probs for each box."""
+        # Greedily pair each box with the unclaimed track it overlaps most.
+        pairs = sorted(((box_iou(b, t["box"]), i, j)
+                        for i, b in enumerate(boxes) for j, t in enumerate(self.tracks)),
+                       reverse=True)
+        match, used = {}, set()
+        for iou, i, j in pairs:
+            if iou < self.min_iou:
+                break
+            if i not in match and j not in used:
+                match[i] = j
+                used.add(j)
+
+        smoothed = []
+        for i, (box, p) in enumerate(zip(boxes, probs)):
+            if i in match:
+                t = self.tracks[match[i]]
+                t["seen"] += 1
+                w = max(1.0 / t["seen"], self.min_weight)
+                t["probs"] = (1 - w) * t["probs"] + w * p
+                t["box"], t["misses"] = box, 0
+            else:
+                t = {"box": box, "probs": p.clone(), "seen": 1, "misses": 0}
+                self.tracks.append(t)
+                used.add(len(self.tracks) - 1)
+            smoothed.append(t["probs"])
+
+        # Age out dogs that weren't seen this frame.
+        for j, t in enumerate(self.tracks):
+            if j not in used:
+                t["misses"] += 1
+        self.tracks = [t for t in self.tracks if t["misses"] <= self.max_misses]
+        return smoothed
+
+
+def draw_results(img, results):
+    """Draw the (box, label) pairs returned by DogBreedDetector.analyze."""
+    for (x1, y1, x2, y2), label in results:
+        draw_labeled_box(img, int(x1), int(y1), int(x2), int(y2), label)
 
 
 def draw_labeled_box(img, x1, y1, x2, y2, text):
@@ -197,7 +285,7 @@ def draw_labeled_box(img, x1, y1, x2, y2, text):
     cv2.putText(img, text, (x1 + 4, top + th + 3), font, scale, WHITE, thick, cv2.LINE_AA)
 
 
-def run_webcam(model: DogBreedDetector, camera: int):
+def run_webcam(model: DogBreedDetector, camera: int, interval: float = ANALYZE_INTERVAL):
     cap = cv2.VideoCapture(camera)
     if not cap.isOpened():
         raise SystemExit(
@@ -208,6 +296,9 @@ def run_webcam(model: DogBreedDetector, camera: int):
     print("Running — press 'q' or ESC in the video window to quit.")
     prev = time.time()
     fps = 0.0
+    last_analyzed = float("-inf")
+    results = []
+    tracker = BreedTracker()
     try:
         while True:
             ok, frame = cap.read()
@@ -215,7 +306,15 @@ def run_webcam(model: DogBreedDetector, camera: int):
                 print("Failed to read frame from camera.")
                 break
 
-            frame, n_dogs = model.process_frame(frame)
+            # Only run the models every `interval` seconds; in between, draw the
+            # last results on the fresh frame so the video stays smooth.
+            if time.time() - last_analyzed >= interval:
+                last_analyzed = time.time()
+                boxes, probs = model.score_frame(frame)
+                smoothed = tracker.update(boxes, probs)
+                results = [(b, model.label(p)) for b, p in zip(boxes, smoothed)]
+            draw_results(frame, results)
+            n_dogs = len(results)
 
             now = time.time()
             fps = 0.9 * fps + 0.1 * (1.0 / max(now - prev, 1e-6))
