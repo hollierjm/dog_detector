@@ -27,7 +27,7 @@ import torch
 import torchvision.transforms.functional as TF
 
 from benchmark import build_label_map, calibration, load_oxford
-from dog_detector import CALIBRATION_FILE, DogBreedDetector, pick_device
+from dog_detector import CALIBRATION_FILE, DogBreedDetector, add_model_args, model_kwargs, pick_device
 
 
 def collect(model: DogBreedDetector, args, label_map):
@@ -85,7 +85,7 @@ def describe(logits, masks, temperature):
 
 def main():
     p = argparse.ArgumentParser(description="Fit confidence calibration for dog_detector")
-    p.add_argument("--accurate", action="store_true", help="calibrate the larger models")
+    add_model_args(p)
     p.add_argument("--threshold", type=float, default=0.6, help="detection threshold (app default)")
     p.add_argument("--crop-pad", type=float, default=0.05, help="crop padding (app default)")
     p.add_argument("--data-dir", type=Path, default=Path("data"))
@@ -96,7 +96,7 @@ def main():
 
     device = torch.device("cpu") if args.cpu else pick_device()
     print(f"Loading models on {device}...")
-    model = DogBreedDetector(device, accurate=args.accurate, det_threshold=args.threshold,
+    model = DogBreedDetector(device, det_threshold=args.threshold, **model_kwargs(args),
                              crop_pad=args.crop_pad, calibrated=False)
     label_map = build_label_map(model)
 

@@ -26,6 +26,10 @@ python dog_detector.py --image dog.jpg          # run on a single image
 python dog_detector.py --image dog.jpg --out annotated.jpg
 python dog_detector.py --threshold 0.5          # detection confidence (default 0.6)
 python dog_detector.py --cpu                    # force CPU
+
+# Mix and tune models (each is benchmarked below)
+python dog_detector.py --detector accurate --classifier fast
+python dog_detector.py --det-size 640 --proposals 300   # smaller detector input = faster
 ```
 
 Press `q` or `Esc` to quit the video window. It runs on CUDA or Apple Silicon (MPS) automatically when available.
@@ -34,15 +38,19 @@ On macOS, give your terminal app camera access in **System Settings > Privacy & 
 
 ## Accuracy
 
-Measured with `benchmark.py` (fast models, threshold 0.6):
+Measured with `benchmark.py` at threshold 0.6. Breed accuracy is the full pipeline
+(detect, then classify) on the Oxford-IIIT Pet test split (2,186 dogs); detection is on
+COCO val2017 (218 dogs). Speed is model time per image on Apple Silicon (MPS).
 
-| Metric | Result |
-|---|---|
-| Correct breed, full pipeline (Oxford-IIIT Pet test, 2,186 dogs) | **84.4%** (95% CI 82.8–85.8) |
-| Correct breed in top 5 | 99.0% |
-| Correct breed, full pipeline, `--accurate` models | **89.8%** (95% CI 88.4–91.0) |
-| Dog detection AP50 (COCO val2017, 218 dogs) | **76.4** |
-| Confidence calibration error (ECE) | 3.0% (21.3% before calibration) |
+| Mode | Correct breed (95% CI) | COCO dog AP50 | ms / image |
+|---|---|---|---|
+| Default (fast) | **84.4%** (82.8–85.8) | 76.4 | 43 |
+| `--accurate` | **90.2%** (88.8–91.3) | 82.6 | 84 |
+
+The `--accurate` detector runs at a 640px input with 300 region proposals. That is 1.8x
+faster than torchvision's 800px / 1000 proposals (147 ms/image) with the same breed
+accuracy (89.8% before). Calibrated confidence error (ECE) is 2–3% in both modes,
+down from 21.3% uncalibrated for the fast models.
 
 ```sh
 python benchmark.py                 # full benchmark, downloads datasets to ./data

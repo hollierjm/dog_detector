@@ -24,6 +24,7 @@ Usage:
     python benchmark.py --limit 300              # quick check: subset of each dataset
     python benchmark.py --datasets oxford        # just one dataset
     python benchmark.py --accurate               # benchmark the larger models
+    python benchmark.py --classifier accurate --det-size 640 --proposals 300   # mix + speed settings
     python benchmark.py --crop-pad 0.15          # try a different crop padding
     python benchmark.py --checkpoint finetuned.pt   # evaluate fine-tuned classifier
     python benchmark.py --baseline benchmark_results/<run>/summary.json   # show deltas
@@ -52,7 +53,8 @@ import torch
 import torchvision.transforms.functional as TF
 from PIL import Image
 
-from dog_detector import COCO_DOG_LABEL, DogBreedDetector, pick_device
+from dog_detector import (COCO_DOG_LABEL, DogBreedDetector, add_model_args, model_kwargs,
+                          pick_device)
 
 # --- Dataset sources ----------------------------------------------------------
 # Pinned to a specific revision so results stay comparable over time.
@@ -452,7 +454,7 @@ def fmt(w):
 
 def print_report(s: dict, baseline: dict | None):
     r = s["run"]
-    print(f"\n=== Benchmark: {r['models']} models, threshold {r['threshold']}, crop pad {r['crop_pad']}"
+    print(f"\n=== Benchmark: {r['models']}, threshold {r['threshold']}, crop pad {r['crop_pad']}"
           + (f", checkpoint {r['checkpoint']}" if r["checkpoint"] else "")
           + f", temperature {r.get('temperature', 1.0):.3f}"
           + (f", limit {r['limit']}" if r["limit"] else "") + " ===")
@@ -518,7 +520,7 @@ def main():
     p.add_argument("--data-dir", type=Path, default=Path("data"), help="dataset cache directory")
     p.add_argument("--limit", type=int, help="evaluate a random subset of N images per dataset")
     p.add_argument("--seed", type=int, default=0, help="seed for --limit sampling")
-    p.add_argument("--accurate", action="store_true", help="benchmark the larger models")
+    add_model_args(p)
     p.add_argument("--threshold", type=float, default=0.6, help="detection threshold (app default 0.6)")
     p.add_argument("--crop-pad", type=float, default=0.05, help="padding around each crop")
     p.add_argument("--checkpoint", help="classifier state_dict to evaluate (e.g. fine-tuned)")
@@ -533,7 +535,7 @@ def main():
     device = torch.device("cpu") if args.cpu else pick_device()
     print(f"Loading models on {device}...")
     # Keep every dog detection down to 0.05 so AP and threshold sweeps can be computed.
-    model = DogBreedDetector(device, accurate=args.accurate, det_threshold=0.05,
+    model = DogBreedDetector(device, det_threshold=0.05, **model_kwargs(args),
                              crop_pad=args.crop_pad, calibrated=not args.no_calibration)
     if args.checkpoint:
         state = torch.load(args.checkpoint, map_location=device)
@@ -554,7 +556,10 @@ def main():
     det_timer, cls_timer = Timer(), Timer()
     summary = {"run": {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "models": "accurate" if args.accurate else "fast", "threshold": args.threshold,
+        "models": f"{model.detector_kind} detector @ {model.det_size}px / {model.proposals} "
+                  f"proposals + {model.classifier_kind} classifier",
+        "detector": model.detector_kind, "classifier": model.classifier_kind,
+        "det_size": model.det_size, "proposals": model.proposals, "threshold": args.threshold,
         "crop_pad": args.crop_pad, "checkpoint": args.checkpoint, "limit": args.limit,
         "seed": args.seed, "device": str(device), "temperature": model.temperature,
     }}

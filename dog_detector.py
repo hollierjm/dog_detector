@@ -9,7 +9,7 @@ Pipeline (two pretrained models, no training required):
 
 Usage:
     python dog_detector.py                    # default webcam, fast models
-    python dog_detector.py --accurate         # slower, more accurate models
+    python dog_detector.py --accurate         # slower, more accurate models (~2x slower)
     python dog_detector.py --camera 1         # use a different camera
     python dog_detector.py --image dog.jpg    # run on a single image instead
 
@@ -42,6 +42,11 @@ IMAGENET_DOG_RANGE = range(151, 269)   # ImageNet classes 151..268 are dog breed
 RED = (0, 0, 255)                      # OpenCV uses BGR
 WHITE = (255, 255, 255)
 CALIBRATION_FILE = Path(__file__).with_name("calibration.json")
+# Detector input size (short side, px) and region proposals per frame, per detector.
+# Chosen with benchmark.py: for the accurate detector, 640px / 300 proposals is 1.8x
+# faster than torchvision's 800 / 1000 with the same breed accuracy (90.2% vs 89.8%).
+# The fast detector keeps 800 / 1000: smaller sizes cost it recall on distant dogs.
+DETECTOR_DEFAULTS = {"fast": (800, 1000), "accurate": (640, 300)}
 
 
 def load_temperature(key: str) -> float:
@@ -62,24 +67,46 @@ def pick_device() -> torch.device:
 
 
 class DogBreedDetector:
+    """
+    detector / classifier: "fast" or "accurate", chosen independently
+    (accurate=True is shorthand for both "accurate").
+    det_size:  short side (pixels) frames are resized to before detection.
+               Smaller is faster. None = the detector's default (DETECTOR_DEFAULTS).
+    proposals: candidate regions the detector scores per frame. None = default.
+    """
+
     def __init__(self, device: torch.device, accurate: bool = False,
                  det_threshold: float = 0.6, crop_pad: float = 0.05,
-                 calibrated: bool = True):
+                 calibrated: bool = True, detector: str | None = None,
+                 classifier: str | None = None, det_size: int | None = None,
+                 proposals: int | None = None):
         self.device = device
         self.det_threshold = det_threshold
         self.crop_pad = crop_pad
+        self.detector_kind = detector or ("accurate" if accurate else "fast")
+        self.classifier_kind = classifier or ("accurate" if accurate else "fast")
 
         # --- 1. Dog detector -------------------------------------------------
-        if accurate:
+        if self.detector_kind == "accurate":
             det_weights = FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT
             self.detector = fasterrcnn_resnet50_fpn_v2(weights=det_weights)
         else:
             det_weights = FasterRCNN_MobileNet_V3_Large_FPN_Weights.DEFAULT
             self.detector = fasterrcnn_mobilenet_v3_large_fpn(weights=det_weights)
+        default_size, default_proposals = DETECTOR_DEFAULTS[self.detector_kind]
+        det_size = det_size or default_size
+        proposals = proposals or default_proposals
+        # Input resolution: keep torchvision's 800:1333 short:long side ratio.
+        self.detector.transform.min_size = (det_size,)
+        self.detector.transform.max_size = round(det_size * 1333 / 800)
+        # Candidate regions kept before / after the region proposal step.
+        self.detector.rpn._pre_nms_top_n["testing"] = proposals
+        self.detector.rpn._post_nms_top_n["testing"] = proposals
+        self.det_size, self.proposals = det_size, proposals
         self.detector.eval().to(device)
 
         # --- 2. Breed classifier ---------------------------------------------
-        if accurate:
+        if self.classifier_kind == "accurate":
             cls_weights = EfficientNet_V2_S_Weights.DEFAULT
             self.classifier = efficientnet_v2_s(weights=cls_weights)
         else:
@@ -96,7 +123,8 @@ class DogBreedDetector:
         # --- 3. Confidence calibration ---------------------------------------
         # A temperature fitted by calibrate.py makes the shown % match how often
         # the prediction is actually right. 1.0 means "no calibration".
-        self.calibration_key = "accurate" if accurate else "fast"
+        # Confidence is a property of the classifier, so it's keyed by classifier.
+        self.calibration_key = self.classifier_kind
         self.temperature = load_temperature(self.calibration_key) if calibrated else 1.0
 
     @torch.inference_mode()
@@ -219,11 +247,32 @@ def run_image(model: DogBreedDetector, path: str, out_path: str | None):
         cv2.destroyAllWindows()
 
 
+def add_model_args(p: argparse.ArgumentParser):
+    """Model-choice flags shared by dog_detector.py, benchmark.py and calibrate.py."""
+    p.add_argument("--accurate", action="store_true",
+                   help="use the larger, more accurate (slower) detector AND classifier")
+    p.add_argument("--detector", choices=["fast", "accurate"],
+                   help="detector to use (overrides --accurate)")
+    p.add_argument("--classifier", choices=["fast", "accurate"],
+                   help="breed classifier to use (overrides --accurate)")
+    p.add_argument("--det-size", type=int,
+                   help="detector input size, short side in px; smaller is faster "
+                        "(default: 800 fast detector, 640 accurate)")
+    p.add_argument("--proposals", type=int,
+                   help="candidate regions per frame; fewer is faster "
+                        "(default: 1000 fast detector, 300 accurate)")
+
+
+def model_kwargs(args) -> dict:
+    return {"accurate": args.accurate, "detector": args.detector,
+            "classifier": args.classifier, "det_size": args.det_size,
+            "proposals": args.proposals}
+
+
 def main():
     p = argparse.ArgumentParser(description="Webcam dog detector + breed labeler (PyTorch)")
     p.add_argument("--camera", type=int, default=0, help="webcam index (default 0)")
-    p.add_argument("--accurate", action="store_true",
-                   help="use larger, more accurate (slower) models")
+    add_model_args(p)
     p.add_argument("--threshold", type=float, default=0.6,
                    help="dog detection confidence threshold (default 0.6)")
     p.add_argument("--image", help="run on an image file instead of the webcam")
@@ -235,8 +284,10 @@ def main():
 
     device = torch.device("cpu") if args.cpu else pick_device()
     print(f"Loading models on {device} (first run downloads weights)...")
-    model = DogBreedDetector(device, accurate=args.accurate, det_threshold=args.threshold,
-                             calibrated=not args.no_calibration)
+    model = DogBreedDetector(device, det_threshold=args.threshold,
+                             calibrated=not args.no_calibration, **model_kwargs(args))
+    print(f"Detector: {model.detector_kind} ({model.det_size}px, {model.proposals} proposals), "
+          f"classifier: {model.classifier_kind}")
     if model.temperature != 1.0:
         print(f"Confidence calibrated (temperature {model.temperature:.3f})")
 
