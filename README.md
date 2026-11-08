@@ -3,10 +3,10 @@
 Real-time dog detection and breed classification from a webcam or image, using PyTorch.
 
 1. **Detection:** a COCO-pretrained Faster R-CNN finds every dog in the frame.
-2. **Breed classification:** each dog crop goes to an ImageNet classifier (ResNet50, or EfficientNetV2 with `--accurate`), restricted to the 120 dog-breed classes.
+2. **Breed classification:** each dog crop goes to an ImageNet classifier (ResNet50, or EfficientNetV2 with `--accurate`), restricted to its 118 dog-breed classes, plus any extra breeds you train (see [More breeds](#more-breeds)).
 3. **Display:** a box and breed label are drawn around each dog.
 
-No training required. Pretrained weights download automatically on first run.
+No training required for the 118 breeds. Pretrained weights download automatically on first run.
 
 ## Setup
 
@@ -56,6 +56,65 @@ down from 21.3% uncalibrated for the fast models.
 python benchmark.py                 # full benchmark, downloads datasets to ./data
 python benchmark.py --limit 300     # quick check
 ```
+
+## More breeds
+
+`train_breeds.py` adds 14 breeds ImageNet doesn't have: American Bulldog, Australian
+Shepherd, Basset Fauve de Bretagne, Bichon Frise, Cane Corso, Chinese Crested, Cockapoo,
+Fila Brasileiro, Greyhound, Havanese, Japanese Spitz, Labradoodle, Shar Pei and Shiba Inu.
+The classifier's features stay frozen; only its last layer changes, so speed is unchanged.
+The result is `breed_head_<classifier>.pth`, which the app loads automatically when
+present. `--imagenet-breeds` ignores it. The accuracy table above is without a head.
+
+```sh
+python train_breeds.py --classifier fast --detector accurate
+python calibrate.py
+python benchmark.py --datasets oxford
+```
+
+It expects these under `./data`, unzipped into `extracted/`:
+[Tsinghua Dogs](https://cg.cs.tsinghua.edu.cn/ThuDogs/) (low-resolution images, annotations
+and split, in `tsinghua-dogs/`) and
+[benni-ben/dog-breeds](https://huggingface.co/datasets/benni-ben/dog-breeds)
+(in `benni-dog-breeds/`). Tsinghua Dogs is published for academic use; check both
+datasets' terms before redistributing images or trained weights.
+
+More Australian Shepherds come from `python download_breed_photos.py` (Udacity's
+dogImages and Wikimedia Commons) and `python download_open_images.py` (Open Images V7,
+whose test split also gives an independent per-breed check). Commons and Open Images
+labels are often wrong (Open Images' "Australian Shepherds" are mostly other dogs, its
+"Bulldogs" half French Bulldogs), so their photos are only used once a person has
+checked the dog crop: `reviewed_photos.csv` records each keep/reject decision.
+
+Oxford test, same 22 breeds and code as the table above, plus the three Oxford breeds
+that only the trained heads can name:
+
+| Classifier | 118 breeds | 132 breeds | American Bulldog | Havanese | Shiba Inu |
+|---|---|---|---|---|---|
+| Fast | 84.4% (82.8–85.8) | 82.9% (81.3–84.5) | 89% | 78% | 90% |
+| Accurate | 90.2% (88.8–91.3) | 87.7% (86.3–89.1) | 95% | 87% | 99% |
+
+Adding breeds costs accuracy on the existing ones, mostly from look-alikes such as
+Staffordshire and American Bulldog. Training weights each breed by how rare it is, so breeds with
+few photos (429 Australian Shepherds against 2,538 Border Collies) aren't drowned out.
+With the extra Australian Shepherds, 82% of held-back ones are named correctly (74%
+before, on a smaller held-back set), and Oxford accuracy is unchanged. The accurate head falls outside the 118-breed range,
+so it isn't enabled by default. Training images matching any Oxford photo are removed
+first: `benni-ben` contains Oxford images, which would otherwise inflate these numbers.
+
+### Training on your own dog
+
+If the app struggles with your dog, collect webcam photos of it and retrain. Keep only
+your dog in view and move it around: different angles, distances and lighting.
+
+```sh
+python dog_detector.py --collect "Australian Shepherd"   # q to stop; repeat any time
+python train_breeds.py --classifier fast --detector accurate
+python calibrate.py
+```
+
+Photos go to `data/my_dogs/<breed>/` (gitignored). Training reports how many of your
+held-back photos it labels correctly.
 
 ## Confidence calibration
 

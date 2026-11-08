@@ -1,10 +1,11 @@
 """
 Real-time dog detection + breed classification from a webcam, using PyTorch.
 
-Pipeline (two pretrained models, no training required):
+Pipeline:
   1. Object detector (Faster R-CNN, COCO-pretrained) finds every "dog" in the frame.
-  2. Each dog crop is passed to an ImageNet classifier (EfficientNetV2 / ResNet50);
-     we keep only the 118 ImageNet dog-breed classes and pick the most likely breed.
+  2. Each dog crop is passed to an ImageNet classifier (EfficientNetV2 / ResNet50).
+     Its 118 dog-breed classes are used as they are, plus any extra breeds trained by
+     train_breeds.py (breed_head_<classifier>.pth), and the likeliest breed is picked.
   3. A red box is drawn around each dog with the breed label above it.
 
 Usage:
@@ -12,6 +13,7 @@ Usage:
     python dog_detector.py --accurate         # slower, more accurate models (~2x slower)
     python dog_detector.py --camera 1         # use a different camera
     python dog_detector.py --image dog.jpg    # run on a single image instead
+    python dog_detector.py --collect "Australian Shepherd"   # save photos of your dog
 
 Press 'q' or ESC to quit.
 """
@@ -24,6 +26,7 @@ from pathlib import Path
 import cv2
 import torch
 import torchvision.transforms.functional as TF
+from torch import nn
 from torchvision.models import (
     EfficientNet_V2_S_Weights,
     ResNet50_Weights,
@@ -42,6 +45,10 @@ IMAGENET_DOG_RANGE = range(151, 269)   # ImageNet classes 151..268 are dog breed
 RED = (0, 0, 255)                      # OpenCV uses BGR
 WHITE = (255, 255, 255)
 CALIBRATION_FILE = Path(__file__).with_name("calibration.json")
+# Extra-breed heads written by train_breeds.py; used automatically when present.
+BREED_HEAD_FILE = "breed_head_{}.pth"
+# Webcam photos saved with --collect, which train_breeds.py trains on.
+MY_DOGS_DIR = Path(__file__).with_name("data") / "my_dogs"
 # Detector input size (short side, px) and region proposals per frame, per detector.
 # Chosen with benchmark.py: for the accurate detector, 640px / 300 proposals is 1.8x
 # faster than torchvision's 800 / 1000 with the same breed accuracy (90.2% vs 89.8%).
@@ -61,6 +68,17 @@ def load_temperature(key: str) -> float:
         return 1.0
 
 
+def crop_box(rgb: torch.Tensor, box, pad: float) -> torch.Tensor:
+    """Crop a box from a [3,H,W] image, padded so the classifier sees the whole dog."""
+    _, H, W = rgb.shape
+    x1, y1, x2, y2 = box
+    pw, ph = pad * (x2 - x1), pad * (y2 - y1)
+    x1, y1 = max(0, int(x1 - pw)), max(0, int(y1 - ph))
+    x2, y2 = min(W, int(x2 + pw)), min(H, int(y2 + ph))
+    x2, y2 = max(x2, x1 + 1), max(y2, y1 + 1)   # never an empty crop
+    return rgb[:, y1:y2, x1:x2]
+
+
 def pick_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -76,13 +94,15 @@ class DogBreedDetector:
     det_size:  short side (pixels) frames are resized to before detection.
                Smaller is faster. None = the detector's default (DETECTOR_DEFAULTS).
     proposals: candidate regions the detector scores per frame. None = default.
+    extra_breeds: use the trained head from train_breeds.py if there is one.
+                  False = only the 118 ImageNet breeds.
     """
 
     def __init__(self, device: torch.device, accurate: bool = False,
                  det_threshold: float = 0.6, crop_pad: float = 0.05,
                  calibrated: bool = True, detector: str | None = None,
                  classifier: str | None = None, det_size: int | None = None,
-                 proposals: int | None = None):
+                 proposals: int | None = None, extra_breeds: bool = True):
         self.device = device
         self.det_threshold = det_threshold
         self.crop_pad = crop_pad
@@ -115,20 +135,50 @@ class DogBreedDetector:
         else:
             cls_weights = ResNet50_Weights.DEFAULT
             self.classifier = resnet50(weights=cls_weights)
-        self.classifier.eval().to(device)
         self.cls_transform = cls_weights.transforms()
 
+        # Split the classifier into a feature extractor and a final breed layer, keeping
+        # only the rows of ImageNet's final layer that are dog breeds.
+        if self.classifier_kind == "accurate":
+            imagenet_head = self.classifier.classifier[1]
+            self.classifier.classifier[1] = nn.Identity()
+        else:
+            imagenet_head = self.classifier.fc
+            self.classifier.fc = nn.Identity()
+        dog_rows = list(IMAGENET_DOG_RANGE)
+        self.breed_head = nn.Linear(imagenet_head.in_features, len(dog_rows))
+        self.breed_head.weight.data.copy_(imagenet_head.weight.data[dog_rows])
+        self.breed_head.bias.data.copy_(imagenet_head.bias.data[dog_rows])
         categories = cls_weights.meta["categories"]
-        self.dog_idx = torch.tensor(list(IMAGENET_DOG_RANGE), device=device)
-        self.breed_names = [categories[i].replace("_", " ").title()
-                            for i in IMAGENET_DOG_RANGE]
+        self.breed_names = [categories[i].replace("_", " ").title() for i in dog_rows]
+
+        head_file = CALIBRATION_FILE.with_name(BREED_HEAD_FILE.format(self.classifier_kind))
+        self.extra_breeds = extra_breeds and head_file.exists()
+        if self.extra_breeds:
+            saved = torch.load(head_file, map_location="cpu", weights_only=True)
+            self.breed_names = saved["names"]
+            self.breed_head = nn.Linear(imagenet_head.in_features, len(self.breed_names))
+            self.breed_head.load_state_dict(saved["head"])
+        self.classifier.eval().to(device)
+        self.breed_head.eval().to(device)
 
         # --- 3. Confidence calibration ---------------------------------------
         # A temperature fitted by calibrate.py makes the shown % match how often
         # the prediction is actually right. 1.0 means "no calibration".
-        # Confidence is a property of the classifier, so it's keyed by classifier.
-        self.calibration_key = self.classifier_kind
+        # Confidence is a property of the classifier and its breed list, so it's keyed
+        # by both.
+        self.calibration_key = self.classifier_kind + ("+extra" if self.extra_breeds else "")
         self.temperature = load_temperature(self.calibration_key) if calibrated else 1.0
+
+    def load_classifier(self, state: dict):
+        """Load a whole-classifier state_dict (1000 ImageNet classes), e.g. a fine-tuned one."""
+        prefix = "classifier.1." if self.classifier_kind == "accurate" else "fc."
+        dog_rows = list(IMAGENET_DOG_RANGE)
+        self.breed_head.weight.data.copy_(state[prefix + "weight"][dog_rows])
+        self.breed_head.bias.data.copy_(state[prefix + "bias"][dog_rows])
+        self.classifier.load_state_dict({k: v for k, v in state.items()
+                                         if not k.startswith(prefix)})
+        self.classifier.eval()
 
     @torch.inference_mode()
     def detect_dogs(self, rgb: torch.Tensor):
@@ -142,20 +192,9 @@ class DogBreedDetector:
     @torch.inference_mode()
     def breed_logits(self, rgb: torch.Tensor, boxes) -> torch.Tensor:
         """Raw (uncalibrated) dog-breed scores for each box crop: tensor [N, n_breeds]."""
-        _, H, W = rgb.shape
-        crops = []
-        for x1, y1, x2, y2 in boxes:
-            # Pad the crop slightly so the classifier sees the whole dog.
-            pw, ph = self.crop_pad * (x2 - x1), self.crop_pad * (y2 - y1)
-            x1, y1 = max(0, int(x1 - pw)), max(0, int(y1 - ph))
-            x2, y2 = min(W, int(x2 + pw)), min(H, int(y2 + ph))
-            x2, y2 = max(x2, x1 + 1), max(y2, y1 + 1)   # never an empty crop
-            crop = rgb[:, y1:y2, x1:x2]
-            crops.append(self.cls_transform(crop))
+        crops = [self.cls_transform(crop_box(rgb, box, self.crop_pad)) for box in boxes]
         batch = torch.stack(crops).to(self.device)
-
-        # Keep only the 118 dog-breed classes.
-        return self.classifier(batch).index_select(1, self.dog_idx)
+        return self.breed_head(self.classifier(batch))
 
     def breed_probs(self, rgb: torch.Tensor, boxes) -> torch.Tensor:
         """Calibrated probabilities over the dog breeds for each box crop: [N, n_breeds].
@@ -264,6 +303,29 @@ class BreedTracker:
         return smoothed
 
 
+class PhotoCollector:
+    """Saves webcam frames of one dog, with the box the app drew, for train_breeds.py.
+
+    Frames go to data/my_dogs/<breed>/<session>/ as NNNN.jpg + NNNN.json. A frame is
+    only saved when exactly one dog is in view, so the label can't land on another dog.
+    """
+
+    def __init__(self, breed: str, every: float = 0.5):
+        self.breed, self.every = breed, every
+        self.dir = MY_DOGS_DIR / breed / time.strftime("%Y%m%d-%H%M%S")
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.last, self.saved = float("-inf"), 0
+
+    def add(self, frame_bgr, boxes):
+        if len(boxes) != 1 or time.time() - self.last < self.every:
+            return
+        self.last = time.time()
+        self.saved += 1
+        name = f"{self.saved:04d}"
+        cv2.imwrite(str(self.dir / f"{name}.jpg"), frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        (self.dir / f"{name}.json").write_text(json.dumps({"box": [round(v, 1) for v in boxes[0]]}))
+
+
 def draw_results(img, results):
     """Draw the (box, label) pairs returned by DogBreedDetector.analyze."""
     for (x1, y1, x2, y2), label in results:
@@ -285,7 +347,8 @@ def draw_labeled_box(img, x1, y1, x2, y2, text):
     cv2.putText(img, text, (x1 + 4, top + th + 3), font, scale, WHITE, thick, cv2.LINE_AA)
 
 
-def run_webcam(model: DogBreedDetector, camera: int, interval: float = ANALYZE_INTERVAL):
+def run_webcam(model: DogBreedDetector, camera: int, interval: float = ANALYZE_INTERVAL,
+               collector: PhotoCollector | None = None):
     cap = cv2.VideoCapture(camera)
     if not cap.isOpened():
         raise SystemExit(
@@ -311,6 +374,8 @@ def run_webcam(model: DogBreedDetector, camera: int, interval: float = ANALYZE_I
             if time.time() - last_analyzed >= interval:
                 last_analyzed = time.time()
                 boxes, probs = model.score_frame(frame)
+                if collector:
+                    collector.add(frame, boxes)   # before drawing, so photos stay clean
                 smoothed = tracker.update(boxes, probs)
                 results = [(b, model.label(p)) for b, p in zip(boxes, smoothed)]
             draw_results(frame, results)
@@ -321,6 +386,10 @@ def run_webcam(model: DogBreedDetector, camera: int, interval: float = ANALYZE_I
             prev = now
             cv2.putText(frame, f"FPS: {fps:.1f}  Dogs: {n_dogs}", (10, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+            if collector:
+                cv2.putText(frame, f"Saving {collector.breed}: {collector.saved} photos "
+                            "(needs exactly 1 dog in view)", (10, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
 
             cv2.imshow("Dog Breed Detector", frame)
             key = cv2.waitKey(1) & 0xFF
@@ -329,6 +398,9 @@ def run_webcam(model: DogBreedDetector, camera: int, interval: float = ANALYZE_I
     finally:
         cap.release()
         cv2.destroyAllWindows()
+        if collector:
+            print(f"Saved {collector.saved} photos to {collector.dir}. "
+                  "Run train_breeds.py to train on them.")
 
 
 def run_image(model: DogBreedDetector, path: str, out_path: str | None):
@@ -360,12 +432,14 @@ def add_model_args(p: argparse.ArgumentParser):
     p.add_argument("--proposals", type=int,
                    help="candidate regions per frame; fewer is faster "
                         "(default: 1000 fast detector, 300 accurate)")
+    p.add_argument("--imagenet-breeds", action="store_true",
+                   help="ignore the head from train_breeds.py; only the 118 ImageNet breeds")
 
 
 def model_kwargs(args) -> dict:
     return {"accurate": args.accurate, "detector": args.detector,
             "classifier": args.classifier, "det_size": args.det_size,
-            "proposals": args.proposals}
+            "proposals": args.proposals, "extra_breeds": not args.imagenet_breeds}
 
 
 def main():
@@ -379,6 +453,8 @@ def main():
     p.add_argument("--cpu", action="store_true", help="force CPU")
     p.add_argument("--no-calibration", action="store_true",
                    help="show raw (uncalibrated) confidence percentages")
+    p.add_argument("--collect", metavar="BREED",
+                   help="webcam: save photos of your dog as this breed for train_breeds.py")
     args = p.parse_args()
 
     device = torch.device("cpu") if args.cpu else pick_device()
@@ -386,14 +462,21 @@ def main():
     model = DogBreedDetector(device, det_threshold=args.threshold,
                              calibrated=not args.no_calibration, **model_kwargs(args))
     print(f"Detector: {model.detector_kind} ({model.det_size}px, {model.proposals} proposals), "
-          f"classifier: {model.classifier_kind}")
+          f"classifier: {model.classifier_kind} ({len(model.breed_names)} breeds)")
     if model.temperature != 1.0:
         print(f"Confidence calibrated (temperature {model.temperature:.3f})")
 
     if args.image:
         run_image(model, args.image, args.out)
     else:
-        run_webcam(model, args.camera)
+        collector = None
+        if args.collect:
+            match = [n for n in model.breed_names if n.lower() == args.collect.lower()]
+            if not match:
+                raise SystemExit(f"--collect: unknown breed {args.collect!r}. "
+                                 f"Known breeds: {', '.join(sorted(model.breed_names))}")
+            collector = PhotoCollector(match[0])
+        run_webcam(model, args.camera, collector=collector)
 
 
 if __name__ == "__main__":

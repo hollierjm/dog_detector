@@ -66,8 +66,9 @@ COCO_IMG_URL = "http://images.cocodataset.org/val2017/{}"
 
 # Oxford-IIIT Pet dog breed -> ImageNet class name(s) counted as correct.
 # Pit bull / Staffordshire labels are genuinely ambiguous, so either is accepted.
-# Breeds with no ImageNet equivalent (American Bulldog, Havanese, Shiba Inu) still
-# count for dog-vs-cat detection but are skipped for breed accuracy.
+# Breeds with no ImageNet equivalent (NEW_OXFORD_BREEDS) still count for dog-vs-cat
+# detection but stay out of the headline breed accuracy, so it remains comparable
+# between models. If train_breeds.py added them, they're reported separately.
 OXFORD_TO_IMAGENET = {
     "American Pit Bull Terrier": ["American Staffordshire terrier", "Staffordshire bullterrier"],
     "Basset Hound": ["basset"],
@@ -92,6 +93,7 @@ OXFORD_TO_IMAGENET = {
     "Wheaten Terrier": ["soft-coated wheaten terrier"],
     "Yorkshire Terrier": ["Yorkshire terrier"],
 }
+NEW_OXFORD_BREEDS = ["American Bulldog", "Havanese", "Shiba Inu"]
 OXFORD_CAT_BREEDS = {"Abyssinian", "Bengal", "Birman", "Bombay", "British Shorthair",
                      "Egyptian Mau", "Maine Coon", "Persian", "Ragdoll", "Russian Blue",
                      "Siamese", "Sphynx"}
@@ -181,6 +183,11 @@ def build_label_map(model: DogBreedDetector) -> dict[str, set[int]]:
     return label_map
 
 
+def new_breed_map(model: DogBreedDetector) -> dict[str, set[int]]:
+    """Oxford breeds outside the headline number that this model can name."""
+    return {b: {model.breed_names.index(b)} for b in NEW_OXFORD_BREEDS if b in model.breed_names}
+
+
 class Timer:
     def __init__(self):
         self.total, self.calls = 0.0, 0
@@ -211,8 +218,7 @@ def load_oxford(data_dir: Path, limit: int | None, seed: int, split: str = "test
     meta = json.loads(table.schema.metadata[b"huggingface"])
     raw_names = meta["info"]["features"]["label"]["names"]
     names = [" ".join(p.title() for p in n.split("_")) for n in raw_names]
-    unknown = set(names) - set(OXFORD_TO_IMAGENET) - OXFORD_CAT_BREEDS - {
-        "American Bulldog", "Havanese", "Shiba Inu"}
+    unknown = set(names) - set(OXFORD_TO_IMAGENET) - OXFORD_CAT_BREEDS - set(NEW_OXFORD_BREEDS)
     if unknown:
         raise SystemExit(f"Unexpected Oxford breed names: {unknown}")
 
@@ -394,7 +400,8 @@ def eval_oxford(model, args, label_map, det_timer, cls_timer):
 
     dogs = [r for r in rows if r["is_dog"]]
     cats = [r for r in rows if not r["is_dog"]]
-    scored = [r for r in dogs if "full_top1" in r]
+    scored = [r for r in dogs if "full_top1" in r and r["breed"] in OXFORD_TO_IMAGENET]
+    new = [r for r in dogs if "full_top1" in r and r["breed"] not in OXFORD_TO_IMAGENET]
 
     per_breed, confusions = {}, Counter()
     for breed in sorted({r["breed"] for r in scored}):
@@ -408,6 +415,9 @@ def eval_oxford(model, args, label_map, det_timer, cls_timer):
         "breed_top1_end_to_end": wilson(sum(r["e2e_top1"] for r in scored), len(scored)),
         "breed_top1_full_image": wilson(sum(r["full_top1"] for r in scored), len(scored)),
         "breed_top5_full_image": wilson(sum(r["full_top5"] for r in scored), len(scored)),
+        "new_breeds_end_to_end": {b: wilson(sum(r["e2e_top1"] for r in new if r["breed"] == b),
+                                            sum(r["breed"] == b for r in new))
+                                  for b in sorted({r["breed"] for r in new})},
         "dogs_detected": wilson(sum(r["dog_detected"] for r in dogs), len(dogs)),
         "cats_called_dogs": wilson(sum(r["dog_detected"] for r in cats), len(cats)),
         # Calibration of the % the app shows next to the breed.
@@ -535,17 +545,19 @@ def main():
     device = torch.device("cpu") if args.cpu else pick_device()
     print(f"Loading models on {device}...")
     # Keep every dog detection down to 0.05 so AP and threshold sweeps can be computed.
-    model = DogBreedDetector(device, det_threshold=0.05, **model_kwargs(args),
+    kwargs = model_kwargs(args)
+    if args.checkpoint:
+        kwargs["extra_breeds"] = False     # a checkpoint replaces the 118-breed classifier
+    model = DogBreedDetector(device, det_threshold=0.05, **kwargs,
                              crop_pad=args.crop_pad, calibrated=not args.no_calibration)
     if args.checkpoint:
         state = torch.load(args.checkpoint, map_location=device)
-        model.classifier.load_state_dict(state.get("state_dict", state))
-        model.classifier.eval()
+        model.load_classifier(state.get("state_dict", state))
         print(f"Loaded classifier weights from {args.checkpoint}")
         if model.temperature != 1.0:
             print("Warning: calibration.json was fitted for the pretrained classifier, not this "
                   "checkpoint. Use --no-calibration or re-fit calibration for these weights.")
-    label_map = build_label_map(model)
+    label_map = build_label_map(model) | new_breed_map(model)
 
     # Warm up (GPU kernels compile on first use) so timings reflect steady state.
     dummy = torch.rand(3, 480, 640)
